@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <title>Counterparty Trezor</title>
+    </head>
+    
+    <body>
+        <div>
+            <p>If you know the node path of the address that controls your assets you can enter it here</p>
+            <input id="nodepath" type="text" placeholder="m/44'/0'/0'">
+            <p>
+                Otherwise, we will search through your addresses manually (default up to 8 deep) to check
+                if any containt counterparty assets
+                <br/>
+                Click this button to export your xpub (public) key
+            </p>
+            <input type="button" class="btn btn-small" value="Export Public Key" onclick="export_pubkey();">
+            <p>Notes:<br/>
+                This tool utilizes third party APIs to search addresses for counterparty assets as well as to gather
+                a list of UTXOs to create transactions. This can harm your privacy. If you are worried about this, there
+                is a standalone python script that can utilize your own bitcoin/counterparty node to perform all that is
+                necessary to send your assets out of an address controlled by your trezor: 
+                
+                <a href="https://gist.github.com/sorce/396fe44739392756abac8c2e213bb11e">
+                    https://gist.github.com/sorce/396fe44739392756abac8c2e213bb11e
+                </a>
+            </p>
+        </div>
+        <hr>
+        <div id="output">
+            
+        </div>
+        
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js"></script>        
+        <script src="https://connect.trezor.io/4/connect.js"></script>
+        <script src="https://rawgit.com/dawsonbotsford/satoshi-bitcoin/master/index.bundle.js"></script>
+        <script src="app.js"></script>
+        <script>
+            /* Quick mapping for some common assets' divisibility so that we don't have to make unneccessary API calls */
+            var asset_divisibility = {
+                ISWT: false, EBEX: false,
+                BITCRYSTALS: true, XCP: true, BITCOINEX: true, KARMATOKEN: true,
+                PIXIEDUST: true, LTBCOIN: true, PEPECASH: true, PROTONEXIUM: true,
+            };
+            
+            TrezorConnect.setCurrency('Bitcoin');
+            var segwit = false;
+            var nodepath = "m/44'/0'/0'";
+            
+            function get_addresses(xpub) {
+                    return btc.getAddressesFromXpub(xpub);
+            }
+            
+            function export_pubkey() {
+                if (segwit) {
+                    
+                } else {
+                    TrezorConnect.getXPubKey(nodepath, function(response) {
+                        if (response.success) {
+                            console.log(response.xpubkey);
+                            console.log('Raw path: ' + response.path);
+                            console.log('Serialized path: ' + response.serializedPath);
+                            
+                            var addresses = get_addresses(response.xpubkey)
+                            var addys_with_balance = [];
+                            for (var i = 0; i < addresses.length; i++) {
+                                var b = fetch_balances_from_coindaddy(addresses[i]);
+                                if (Object.keys(b).length > 0) {
+                                    var tmp = {
+                                        'address': addresses[i],
+                                        assets: []
+                                    };
+
+                                    $.map(b, function(value, key) {
+                                        tmp['assets'].push({
+                                            asset: key,
+                                            quantity: value.quantity_normalized
+                                        });
+                                    });
+                                    addys_with_balance.push(tmp);
+                                }
+                            }
+                            list_addresses_to_select(addys_with_balance);
+                        } else {
+                            console.log('Error: ' + response.error);
+                        }
+                    });
+                }
+            }
+            
+            function coindaddy_counterparty(payload) {
+                if (typeof payload.jsonrpc === 'undefined') { payload.jsonrpc = '2.0'; }
+                if (typeof payload.id === 'undefined') { payload.id = 0; }
+                
+                
+                var url = 'http://public.coindaddy.io:4000/api/';
+                var authorizationBasic = window.btoa('rpc:1234');
+                
+                var request = new XMLHttpRequest();
+                request.open('POST', url, false);
+                request.setRequestHeader('Content-Type', 'application/json');
+                request.setRequestHeader('Authorization', 'Basic ' + authorizationBasic);
+                request.setRequestHeader('Accept', 'application/json');
+                //request.timeout = 4000;
+                request.send(JSON.stringify(payload));
+                
+                var resp = JSON.parse(request.responseText);
+                return resp;
+            }
+            
+            function get_asset_divisibility(asset) {
+                if(asset_divisibility.hasOwnProperty(asset)) {
+                    return asset_divisibility[asset];
+                }
+                
+                var payload = {
+                    method: 'get_issuances',
+                    params: {
+                        filters: [{
+                            field: 'asset', op: '==',
+                            value: asset
+                        }]
+                    }
+                };
+                var resp = coindaddy_counterparty(payload);
+                var last = resp.result[resp.result.length - 1];
+                
+                asset_divisibility[asset] = Boolean(last.divisible);
+                
+                console.log('Fetched divisibility of ' + asset + ' from coindaddy: ' + asset_divisibility[asset]);
+                return asset_divisibility[asset];
+            }
+            
+            function fetch_balances_from_coindaddy(address) {
+                var payload = {
+                    method: 'get_balances',
+                    params: {
+                        filters: [{
+                            field: 'address', op: '==',
+                            value: address
+                        }],
+                        filterop: 'or'
+                    }
+                };
+                var resp = coindaddy_counterparty(payload);
+                
+                var address_balances = {};
+                for (var i = 0; i < resp.result.length; i++) {
+                    assetd = resp.result[i];
+                    if (assetd.quantity > 0) {
+                        var divis = get_asset_divisibility(assetd.asset);
+                        
+                        var q = assetd.quantity;
+                        if (divis) {
+                            q = sb.toBitcoin(assetd.quantity);
+                        }
+                        
+                        address_balances[assetd.asset] = {
+                            quantity: assetd.quantity,
+                            quantity_normalized: q
+                        };
+                    }
+                }
+                console.log(JSON.stringify(address_balances));
+                return address_balances;
+            }
+            
+            function list_addresses_to_select(addresses) {
+                var h = '<div class="">';
+                var t = '';
+                
+                for (var i = 0; i < addresses.length; i++) {
+                    h += '<input type="radio" name="address_select" value="' + addresses[i].address + '">' + addresses[i].address;
+                    if (addresses[i].assets.length > 0) {
+                        t = '<br/>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;' + addresses[i].assets.length + ' Assets: ';
+                        var ti = addresses[i].assets.length >= 10 ? 9 : addresses[i].assets.length;
+                        for (var asset_i = 0; asset_i < ti; asset_i++) {
+                            t += '' + addresses[i].assets[asset_i].asset + ', ';
+                        }
+                        if (ti !== addresses[i].assets.length) {
+                            t += '...';
+                        } else {
+                            t = t.slice(0, t.length - 2); // take off the last ", "
+                        }
+                        t += '<br/>';
+                        h += t;
+                    }
+                }
+                h += '<br/><br/><input type="button" id="use_address_button" value="Use Address">';
+                h += '</div>';
+                $('#output').html(h);
+                $('#use_address_button').click(function() {
+                    var a = $('input[name="address_select"]:checked').val();
+                    if (a) {
+                        alert(a);
+                    }
+                });
+            }
+        </script>
+    </body>
+</html>
